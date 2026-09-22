@@ -1,9 +1,8 @@
-# @ModuleName: Generate summary tables by running commands
-# @Function:
-# @Author: ggl
-# @Time: 2025/10/24 11:25
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+# @ModuleName: OHRC-Sentinel main pipeline
+# @Author: ggl
 
 import os
 import sys
@@ -11,141 +10,370 @@ import glob
 import subprocess
 import pandas as pd
 
+
 def process_result(result, combined_file, header_written, basename):
     """
-    Check the subprocess result, extract lines, remove the header
-    (only keep header from the first sample), and append to the combined file.
-    Returns the updated header_written status.
+    Check the subprocess result, remove duplicated headers,
+    and append the result to the combined file.
     """
-    if result.returncode != 0:
-        print(f"❌ {basename} encountered an error:\n{result.stderr}\n")
-        return None, header_written  # Return None to skip
 
-    lines = result.stdout.strip().splitlines()
-    if not lines:
-        print(f"⚠️ No output for {basename}, skipping.\n")
+    if result.returncode != 0:
+        print(f"❌ {basename} encountered an error:")
+        print(result.stderr)
         return None, header_written
 
-    # Remove header; keep only the first sample’s header
+    lines = result.stdout.strip().splitlines()
+
+    if not lines:
+        print(f"⚠️ No output for {basename}, skipping.")
+        return None, header_written
+
     if header_written and lines[0].startswith("#FILE"):
         lines = lines[1:]
     else:
         header_written = True
 
-    with open(combined_file, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    if lines:
+        with open(combined_file, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
 
-    print(f"✅ Results from {basename} appended to {combined_file}\n")
+    print(f"✅ Results from {basename} appended to {combined_file}")
+
     return lines, header_written
 
-# Usage: python run_abricate.py "./*.fna" "./output/"
-if len(sys.argv) != 3:
-    print("Example: python create_summary_tab.py './*.fna' ./output/")
+
+# ============================================================
+# 1. Command-line arguments
+# ============================================================
+
+if len(sys.argv) != 4:
+    print(
+        "\nUsage:\n"
+        "python create_summary_tab.py './*.fna' ./output/ metadata.tsv\n"
+    )
     sys.exit(1)
 
 input_pattern = sys.argv[1]
-output_dir = sys.argv[2]
+output_dir = os.path.abspath(sys.argv[2])
+metadata_file = os.path.abspath(sys.argv[3])
 
-# Match all .fna files
-fna_files = sorted(glob.glob(input_pattern))
-if not fna_files:
-    print(f"❌ No .fna files found matching pattern: {input_pattern}")
-    sys.exit(1)
-
-# Ensure output directory exists
 os.makedirs(output_dir, exist_ok=True)
 
-pla_combined_tab = os.path.join(output_dir, "all_samples_plasmid.tab")
-res_combined_tab = os.path.join(output_dir, "all_samples_res.tab")
-pla_summary_tab = os.path.join(output_dir, "all_samples_plasmid_summary.tab")
-res_summary_tab = os.path.join(output_dir, "all_samples_res_summary.tab")
-padloc_combined_csv = os.path.join(output_dir, "all_samples_padloc.csv")
+if not os.path.exists(metadata_file):
+    raise FileNotFoundError(
+        f"❌ Metadata file not found: {metadata_file}"
+    )
 
-# Remove old files if they exist
-for f in [pla_combined_tab, res_combined_tab, pla_summary_tab, res_summary_tab, padloc_combined_csv]:
+# ============================================================
+# 2. Find genome files
+# ============================================================
+
+fna_files = sorted(glob.glob(input_pattern))
+
+if not fna_files:
+    print(
+        f"❌ No .fna files found matching pattern: {input_pattern}"
+    )
+    sys.exit(1)
+
+print("\n==============================")
+print("      OHRC-Sentinel")
+print("==============================")
+print(f"Genome files : {len(fna_files)}")
+print(f"Output dir   : {output_dir}")
+print(f"Metadata     : {metadata_file}")
+print("==============================\n")
+
+
+# ============================================================
+# 3. Check metadata
+# ============================================================
+
+metadata = pd.read_csv(metadata_file, sep="\t")
+
+required_columns = {"Sample_ID", "ST", "Source"}
+
+missing_columns = required_columns - set(metadata.columns)
+
+if missing_columns:
+    raise ValueError(
+        "❌ Metadata file is missing required columns: "
+        + ", ".join(sorted(missing_columns))
+    )
+
+metadata["Sample_ID"] = metadata["Sample_ID"].astype(str)
+
+genome_ids = [
+    os.path.splitext(os.path.basename(f))[0]
+    for f in fna_files
+]
+
+missing_metadata = sorted(
+    set(genome_ids) - set(metadata["Sample_ID"])
+)
+
+if missing_metadata:
+    print("⚠️ The following genome files do not have metadata:")
+    for x in missing_metadata:
+        print(f"   {x}")
+
+    raise ValueError(
+        "❌ Every genome must have a corresponding Sample_ID in metadata.tsv."
+    )
+
+# Keep only genomes used in this analysis
+metadata = metadata[
+    metadata["Sample_ID"].isin(genome_ids)
+].copy()
+
+metadata.to_csv(
+    os.path.join(output_dir, "metadata_used.tsv"),
+    sep="\t",
+    index=False
+)
+
+# ============================================================
+# 4. Output files
+# ============================================================
+
+pla_combined_tab = os.path.join(
+    output_dir, "all_samples_plasmid.tab"
+)
+
+res_combined_tab = os.path.join(
+    output_dir, "all_samples_res.tab"
+)
+
+pla_summary_tab = os.path.join(
+    output_dir, "all_samples_plasmid_summary.tab"
+)
+
+res_summary_tab = os.path.join(
+    output_dir, "all_samples_res_summary.tab"
+)
+
+padlocresult_tab = os.path.join(
+    output_dir, "padloc_merged.tab"
+)
+
+padlocresult_summary_tab = os.path.join(
+    output_dir, "padloc_merged_summary.tab"
+)
+
+
+# Remove previous files
+for f in [
+    pla_combined_tab,
+    res_combined_tab,
+    pla_summary_tab,
+    res_summary_tab,
+    padlocresult_tab,
+    padlocresult_summary_tab
+]:
     if os.path.exists(f):
         os.remove(f)
 
-padloc_csv_files = []
+
+# ============================================================
+# 5. Run ABRicate and PADLOC
+# ============================================================
+
 header_written1 = False
 header_written2 = False
 
 for fna in fna_files:
-    basename = os.path.splitext(os.path.basename(fna))[0]
+
+    basename = os.path.splitext(
+        os.path.basename(fna)
+    )[0]
+
+    print("\n--------------------------------")
     print(f"🚀 Processing: {basename}")
+    print("--------------------------------")
 
-    # Keep original command format
-    cmd1 = f"abricate --db plasmidfinder --mincov 90 --minid 90 {fna}"
-    cmd2 = f"abricate --db resfinder --mincov 90 --minid 90 {fna}"
+    # --------------------------------------------------------
+    # PlasmidFinder
+    # --------------------------------------------------------
 
-    # Capture command outputs
-    result1 = subprocess.run(cmd1, shell=True, capture_output=True, text=True)
-    result2 = subprocess.run(cmd2, shell=True, capture_output=True, text=True)
+    cmd1 = [
+        "abricate",
+        "--db",
+        "plasmidfinder",
+        "--mincov",
+        "90",
+        "--minid",
+        "90",
+        fna
+    ]
 
-    # Main loop
-    lines1, header_written1 = process_result(result1, pla_combined_tab, header_written1, basename)
-    if lines1 is None:
-        continue  # Skip this iteration
+    result1 = subprocess.run(
+        cmd1,
+        capture_output=True,
+        text=True
+    )
 
-    lines2, header_written2 = process_result(result2, res_combined_tab, header_written2, basename)
-    if lines2 is None:
-        continue  # Skip this iteration
+    _, header_written1 = process_result(
+        result1,
+        pla_combined_tab,
+        header_written1,
+        basename
+    )
 
-    # Run padloc
-    padloc_outdir = os.path.join(output_dir, f"{basename}_padloc")
-    os.makedirs(padloc_outdir, exist_ok=True)
+    # --------------------------------------------------------
+    # ResFinder
+    # --------------------------------------------------------
 
-    # Construct padloc command
-    cmd3 = f"padloc --fna {fna} --cpu 8 -o {padloc_outdir}"
-    subprocess.run(cmd3, shell=True, text=True)
+    cmd2 = [
+        "abricate",
+        "--db",
+        "resfinder",
+        "--mincov",
+        "90",
+        "--minid",
+        "90",
+        fna
+    ]
+
+    result2 = subprocess.run(
+        cmd2,
+        capture_output=True,
+        text=True
+    )
+
+    _, header_written2 = process_result(
+        result2,
+        res_combined_tab,
+        header_written2,
+        basename
+    )
+
+    # --------------------------------------------------------
+    # PADLOC
+    # --------------------------------------------------------
+
+    padloc_outdir = os.path.join(
+        output_dir,
+        f"{basename}_padloc"
+    )
+
+    os.makedirs(
+        padloc_outdir,
+        exist_ok=True
+    )
+
+    cmd3 = [
+        "padloc",
+        "--fna",
+        fna,
+        "--cpu",
+        "8",
+        "-o",
+        padloc_outdir
+    ]
+
+    result3 = subprocess.run(
+        cmd3,
+        text=True
+    )
+
+    if result3.returncode != 0:
+        print(
+            f"⚠️ PADLOC failed for {basename}"
+        )
 
 
+# ============================================================
+# 6. Generate ABRicate summary
+# ============================================================
 
-# Step 2: Generate summary tables
-print("📄 Generating summary files ...")
-cmd1_2 = f"abricate --summary {pla_combined_tab} > {pla_summary_tab}"
-cmd2_2 = f"abricate --summary {res_combined_tab} > {res_summary_tab}"
-subprocess.run(cmd1_2, shell=True, check=True)
-subprocess.run(cmd2_2, shell=True, check=True)
+print("\n📄 Generating ABRicate summary files...")
 
-print(f"🎉 All files processed! Summary file located at: {pla_summary_tab}")
-print(f"🎉 All files processed! Summary file located at: {res_summary_tab}")
+subprocess.run(
+    [
+        "abricate",
+        "--summary",
+        pla_combined_tab
+    ],
+    stdout=open(pla_summary_tab, "w"),
+    check=True
+)
+
+subprocess.run(
+    [
+        "abricate",
+        "--summary",
+        res_combined_tab
+    ],
+    stdout=open(res_summary_tab, "w"),
+    check=True
+)
+
+print(
+    f"✅ Plasmid summary: {pla_summary_tab}"
+)
+
+print(
+    f"✅ ARG summary: {res_summary_tab}"
+)
 
 
-# ---------------------------
-# Merge all padloc CSV files
-# ---------------------------
-cmd3_2 = f"mv ./output/*/*.csv ./output/"
-subprocess.run(cmd3_2, shell=True, check=True)
+# ============================================================
+# 7. Merge PADLOC results
+# ============================================================
 
-# Output files
-padlocresult_tab = "./output/padloc_merged.tab"
-padlocresult_summary_tab = "./output/padloc_merged_summary.tab"
-
-# Fixed header columns
 columns = [
-    "#FILE", "SEQUENCE", "START", "END", "STRAND", "GENE",
-    "COVERAGE", "COVERAGE_MAP", "GAPS", "%COVERAGE", "%IDENTITY",
-    "DATABASE", "ACCESSION", "PRODUCT", "RESISTANCE"
+    "#FILE",
+    "SEQUENCE",
+    "START",
+    "END",
+    "STRAND",
+    "GENE",
+    "COVERAGE",
+    "COVERAGE_MAP",
+    "GAPS",
+    "%COVERAGE",
+    "%IDENTITY",
+    "DATABASE",
+    "ACCESSION",
+    "PRODUCT",
+    "RESISTANCE"
 ]
 
-# Create empty DataFrame
 merged_df = pd.DataFrame(columns=columns)
 
-# Traverse all *_padloc.csv files under output/
-csv_files = sorted(glob.glob("./output/*_padloc.csv"))
+csv_files = sorted(
+    glob.glob(
+        os.path.join(
+            output_dir,
+            "*_padloc",
+            "*.csv"
+        )
+    )
+)
 
 for csv_file in csv_files:
-    # Read CSV file
-    df = pd.read_csv(csv_file)
 
-    # Extract "system" column as GENE
-    if "system" not in df.columns:
-        print(f"⚠️ {csv_file} does not contain 'system' column, skipping.")
+    try:
+        df = pd.read_csv(csv_file)
+    except Exception as e:
+        print(
+            f"⚠️ Cannot read PADLOC file: "
+            f"{csv_file}\n{e}"
+        )
         continue
 
+    if "system" not in df.columns:
+        print(
+            f"⚠️ {csv_file} does not contain "
+            "'system' column, skipping."
+        )
+        continue
+
+    file_prefix = os.path.basename(
+        os.path.dirname(csv_file)
+    ).replace("_padloc", "")
+
     n = len(df)
-    file_prefix = os.path.basename(csv_file).split("_padloc")[0]
 
     temp_df = pd.DataFrame({
         "#FILE": [file_prefix] * n,
@@ -162,36 +390,82 @@ for csv_file in csv_files:
         "DATABASE": [""] * n,
         "ACCESSION": [""] * n,
         "PRODUCT": [""] * n,
-        "RESISTANCE": [""] * n,
+        "RESISTANCE": [""] * n
     })
 
-    merged_df = pd.concat([merged_df, temp_df], ignore_index=True)
+    merged_df = pd.concat(
+        [merged_df, temp_df],
+        ignore_index=True
+    )
 
-# Save as tab-delimited file
-merged_df.to_csv(padlocresult_tab, sep="\t", index=False)
-print(f"✅ Merged file generated: {padlocresult_tab}")
+merged_df.to_csv(
+    padlocresult_tab,
+    sep="\t",
+    index=False
+)
 
-# Generate padloc summary
-cmd3_3 = f"abricate --summary {padlocresult_tab} > {padlocresult_summary_tab}"
-subprocess.run(cmd3_3, shell=True, check=True)
-print(f"🎉 All files processed! Summary file located at: {padlocresult_summary_tab}")
+print(
+    f"✅ PADLOC merged file: "
+    f"{padlocresult_tab}"
+)
 
 
+# ============================================================
+# 8. Generate PADLOC summary
+# ============================================================
+
+subprocess.run(
+    [
+        "abricate",
+        "--summary",
+        padlocresult_tab
+    ],
+    stdout=open(
+        padlocresult_summary_tab,
+        "w"
+    ),
+    check=True
+)
+
+print(
+    f"✅ PADLOC summary: "
+    f"{padlocresult_summary_tab}"
+)
 
 
-# ----------------------------
-# 🚀 Automatically run “Integrated_summary_xlsx.py”
-# ----------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))  # Get current script directory
-merge_script = os.path.join(current_dir, "Integrated_summary_xlsx.py")
+# ============================================================
+# 9. Run Integrated_summary_xlsx.py
+# ============================================================
 
-if os.path.exists(merge_script):
-    print("\n==============================")
-    print("✅ Executing integrated summary merge script...")
-    print("==============================\n")
-    subprocess.run(["python", merge_script], check=True)
-    print("\n==============================")
-    print("✅ Integrated summary merge completed!")
-    print("==============================\n")
-else:
-    print(f"❌ Merge script not found: {merge_script}")
+current_dir = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+merge_script = os.path.join(
+    current_dir,
+    "Integrated_summary_xlsx.py"
+)
+
+if not os.path.exists(merge_script):
+    raise FileNotFoundError(
+        f"❌ Integrated_summary_xlsx.py not found: "
+        f"{merge_script}"
+    )
+
+print("\n==============================")
+print("▶ Running Integrated_summary_xlsx.py")
+print("==============================")
+
+subprocess.run(
+    [
+        sys.executable,
+        merge_script,
+        output_dir,
+        metadata_file
+    ],
+    check=True
+)
+
+print("\n==============================")
+print("✅ OHRC-Sentinel completed")
+print("==============================")
